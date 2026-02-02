@@ -217,11 +217,20 @@ static async Task<WorkflowResponse> ExecuteWorkflowAsync(
     string input,
     ILogger logger)
 {
-    // Build sequential workflow using the built-in AgentWorkflowBuilder.
-    // The SDK now properly handles conversation history between agents,
-    // eliminating the need for the TextOnlyAgentExecutor workaround.
-    var workflow = AgentWorkflowBuilder.BuildSequential(agents);
-    logger.LogInformation("Built sequential workflow with {Count} agents", agents.Count);
+    // Build sequential workflow using WorkflowBuilder with explicit agent bindings.
+    // This approach gives more control over how agents are chained together.
+    var bindings = agents.Select(a => new AIAgentBinding(a, emitEvents: true)).ToList();
+    
+    var workflowBuilder = new WorkflowBuilder(bindings[0]);
+    for (int i = 1; i < bindings.Count; i++)
+    {
+        workflowBuilder.BindExecutor(bindings[i]);
+        workflowBuilder.AddEdge(bindings[i - 1], bindings[i]);
+    }
+    workflowBuilder.WithOutputFrom(bindings[^1]);
+    
+    var workflow = workflowBuilder.Build();
+    logger.LogInformation("Built sequential workflow with {Count} agents using explicit bindings", agents.Count);
 
     // Prepare input as a ChatMessage (required by agent workflows)
     var messages = new List<ChatMessage> { new(ChatRole.User, input) };
@@ -237,17 +246,21 @@ static async Task<WorkflowResponse> ExecuteWorkflowAsync(
 
     await foreach (var evt in run.WatchStreamAsync())
     {
+        // Log all events for debugging
+        logger.LogDebug("Workflow event: {EventType}", evt.GetType().Name);
+        
         switch (evt)
         {
             case ExecutorInvokedEvent invoked:
                 // New agent starting - create a step result
                 currentAgentName = invoked.ExecutorId;
                 currentStep = new AgentStepResult { AgentName = currentAgentName ?? "Unknown" };
-                logger.LogDebug("Agent {AgentName} invoked", currentAgentName);
+                logger.LogInformation("Agent {AgentName} invoked", currentAgentName);
                 break;
 
             case AgentResponseEvent responseEvent:
                 // Collect agent response data using the typed Response property
+                logger.LogDebug("Agent response received for {ExecutorId}", responseEvent.ExecutorId);
                 if (currentStep != null && responseEvent.Response.Messages != null)
                 {
                     foreach (var msg in responseEvent.Response.Messages)
@@ -294,17 +307,36 @@ static async Task<WorkflowResponse> ExecuteWorkflowAsync(
 
             case ExecutorCompletedEvent completed:
                 // Agent completed - save the step
+                logger.LogInformation("Agent {AgentName} completed", completed.ExecutorId);
                 if (currentStep != null)
                 {
-                    logger.LogDebug("Agent {AgentName} completed with {ToolCallCount} tool calls", 
+                    logger.LogInformation("Agent {AgentName} completed with {ToolCallCount} tool calls", 
                         currentStep.AgentName, currentStep.ToolCalls.Count);
                     agentSteps.Add(currentStep);
                     currentStep = null;
                 }
                 break;
 
+            case ExecutorFailedEvent failed:
+                // Agent failed - log the error (Data property contains the Exception)
+                var failedException = failed.Data as Exception;
+                logger.LogError("Agent {AgentName} failed: {Error}", failed.ExecutorId, failedException?.Message ?? "Unknown error");
+                if (currentStep != null)
+                {
+                    currentStep.FinalMessage = $"Error: {failedException?.Message ?? "Unknown error"}";
+                    agentSteps.Add(currentStep);
+                    currentStep = null;
+                }
+                break;
+
+            case WorkflowErrorEvent errorEvent:
+                // Workflow error
+                logger.LogError("Workflow error: {Error}", errorEvent.Exception?.Message ?? "Unknown error");
+                break;
+
             case WorkflowOutputEvent outputEvent:
                 // Capture final workflow output
+                logger.LogDebug("Workflow output event received");
                 if (outputEvent.Data is AgentResponse agentResponse)
                 {
                     foreach (var msg in agentResponse.Messages ?? [])
@@ -321,6 +353,11 @@ static async Task<WorkflowResponse> ExecuteWorkflowAsync(
                         }
                     }
                 }
+                break;
+                
+            default:
+                // Log unhandled event types
+                logger.LogDebug("Unhandled workflow event type: {EventType}", evt.GetType().FullName);
                 break;
         }
     }
@@ -343,9 +380,19 @@ static async Task<WorkflowResponse> ExecuteWorkflowStreamingAsync(
     ILogger logger,
     Func<AgentStepResult, Task> onStepCompleted)
 {
-    // Build sequential workflow using the built-in AgentWorkflowBuilder
-    var workflow = AgentWorkflowBuilder.BuildSequential(agents);
-    logger.LogInformation("Built sequential workflow with {Count} agents for streaming", agents.Count);
+    // Build sequential workflow using WorkflowBuilder with explicit agent bindings
+    var bindings = agents.Select(a => new AIAgentBinding(a, emitEvents: true)).ToList();
+    
+    var workflowBuilder = new WorkflowBuilder(bindings[0]);
+    for (int i = 1; i < bindings.Count; i++)
+    {
+        workflowBuilder.BindExecutor(bindings[i]);
+        workflowBuilder.AddEdge(bindings[i - 1], bindings[i]);
+    }
+    workflowBuilder.WithOutputFrom(bindings[^1]);
+    
+    var workflow = workflowBuilder.Build();
+    logger.LogInformation("Built sequential workflow with {Count} agents for streaming using explicit bindings", agents.Count);
 
     // Prepare input as a ChatMessage
     var messages = new List<ChatMessage> { new(ChatRole.User, input) };
@@ -361,15 +408,19 @@ static async Task<WorkflowResponse> ExecuteWorkflowStreamingAsync(
 
     await foreach (var evt in run.WatchStreamAsync())
     {
+        // Log all events for debugging
+        logger.LogDebug("Streaming workflow event: {EventType}", evt.GetType().Name);
+        
         switch (evt)
         {
             case ExecutorInvokedEvent invoked:
                 currentAgentName = invoked.ExecutorId;
                 currentStep = new AgentStepResult { AgentName = currentAgentName ?? "Unknown" };
-                logger.LogDebug("Agent {AgentName} invoked (streaming)", currentAgentName);
+                logger.LogInformation("Agent {AgentName} invoked (streaming)", currentAgentName);
                 break;
 
             case AgentResponseEvent responseEvent:
+                logger.LogDebug("Agent response received for {ExecutorId} (streaming)", responseEvent.ExecutorId);
                 if (currentStep != null && responseEvent.Response.Messages != null)
                 {
                     foreach (var msg in responseEvent.Response.Messages)
@@ -415,9 +466,10 @@ static async Task<WorkflowResponse> ExecuteWorkflowStreamingAsync(
                 break;
 
             case ExecutorCompletedEvent completed:
+                logger.LogInformation("Agent {AgentName} completed (streaming)", completed.ExecutorId);
                 if (currentStep != null)
                 {
-                    logger.LogDebug("Agent {AgentName} completed (streaming) with {ToolCallCount} tool calls", 
+                    logger.LogInformation("Agent {AgentName} completed (streaming) with {ToolCallCount} tool calls", 
                         currentStep.AgentName, currentStep.ToolCalls.Count);
                     agentSteps.Add(currentStep);
                     
@@ -427,7 +479,24 @@ static async Task<WorkflowResponse> ExecuteWorkflowStreamingAsync(
                 }
                 break;
 
+            case ExecutorFailedEvent failed:
+                var streamingFailedException = failed.Data as Exception;
+                logger.LogError("Agent {AgentName} failed (streaming): {Error}", failed.ExecutorId, streamingFailedException?.Message ?? "Unknown error");
+                if (currentStep != null)
+                {
+                    currentStep.FinalMessage = $"Error: {streamingFailedException?.Message ?? "Unknown error"}";
+                    agentSteps.Add(currentStep);
+                    await onStepCompleted(currentStep);
+                    currentStep = null;
+                }
+                break;
+
+            case WorkflowErrorEvent errorEvent:
+                logger.LogError("Workflow error (streaming): {Error}", errorEvent.Exception?.Message ?? "Unknown error");
+                break;
+
             case WorkflowOutputEvent outputEvent:
+                logger.LogDebug("Workflow output event received (streaming)");
                 if (outputEvent.Data is AgentResponse agentResponse)
                 {
                     foreach (var msg in agentResponse.Messages ?? [])
@@ -444,6 +513,10 @@ static async Task<WorkflowResponse> ExecuteWorkflowStreamingAsync(
                         }
                     }
                 }
+                break;
+                
+            default:
+                logger.LogDebug("Unhandled streaming workflow event type: {EventType}", evt.GetType().FullName);
                 break;
         }
     }
