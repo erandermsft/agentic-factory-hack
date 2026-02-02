@@ -212,15 +212,16 @@ app.Run();
 // Workflow Execution
 // ============================================================================
 
-static async Task<WorkflowResponse> ExecuteWorkflowAsync(
-    List<AIAgent> agents,
-    string input,
-    ILogger logger)
+/// <summary>
+/// Builds a sequential workflow from a list of agents using explicit WorkflowBuilder and AIAgentBinding.
+/// This approach gives more control over how agents are chained together than AgentWorkflowBuilder.BuildSequential.
+/// </summary>
+static Workflow BuildSequentialWorkflow(List<AIAgent> agents, ILogger logger)
 {
-    // Build sequential workflow using WorkflowBuilder with explicit agent bindings.
-    // This approach gives more control over how agents are chained together.
+    // Create bindings for each agent with event emission enabled
     var bindings = agents.Select(a => new AIAgentBinding(a, emitEvents: true)).ToList();
     
+    // Build the workflow with explicit edges between agents
     var workflowBuilder = new WorkflowBuilder(bindings[0]);
     for (int i = 1; i < bindings.Count; i++)
     {
@@ -231,6 +232,24 @@ static async Task<WorkflowResponse> ExecuteWorkflowAsync(
     
     var workflow = workflowBuilder.Build();
     logger.LogInformation("Built sequential workflow with {Count} agents using explicit bindings", agents.Count);
+    
+    return workflow;
+}
+
+static async Task<WorkflowResponse> ExecuteWorkflowAsync(
+    List<AIAgent> agents,
+    string input,
+    ILogger logger)
+{
+    // Validate agents list
+    if (agents.Count == 0)
+    {
+        logger.LogWarning("No agents provided to workflow");
+        return new WorkflowResponse { FinalMessage = "No agents configured" };
+    }
+    
+    // Build sequential workflow using the shared helper
+    var workflow = BuildSequentialWorkflow(agents, logger);
 
     // Prepare input as a ChatMessage (required by agent workflows)
     var messages = new List<ChatMessage> { new(ChatRole.User, input) };
@@ -380,19 +399,15 @@ static async Task<WorkflowResponse> ExecuteWorkflowStreamingAsync(
     ILogger logger,
     Func<AgentStepResult, Task> onStepCompleted)
 {
-    // Build sequential workflow using WorkflowBuilder with explicit agent bindings
-    var bindings = agents.Select(a => new AIAgentBinding(a, emitEvents: true)).ToList();
-    
-    var workflowBuilder = new WorkflowBuilder(bindings[0]);
-    for (int i = 1; i < bindings.Count; i++)
+    // Validate agents list
+    if (agents.Count == 0)
     {
-        workflowBuilder.BindExecutor(bindings[i]);
-        workflowBuilder.AddEdge(bindings[i - 1], bindings[i]);
+        logger.LogWarning("No agents provided to streaming workflow");
+        return new WorkflowResponse { FinalMessage = "No agents configured" };
     }
-    workflowBuilder.WithOutputFrom(bindings[^1]);
     
-    var workflow = workflowBuilder.Build();
-    logger.LogInformation("Built sequential workflow with {Count} agents for streaming using explicit bindings", agents.Count);
+    // Build sequential workflow using the shared helper
+    var workflow = BuildSequentialWorkflow(agents, logger);
 
     // Prepare input as a ChatMessage
     var messages = new List<ChatMessage> { new(ChatRole.User, input) };
