@@ -4,6 +4,7 @@ using System.Text.Json;
 
 using Microsoft.Agents.AI;
 using Microsoft.Agents.AI.Workflows;
+using Microsoft.Extensions.AI;
 
 using Azure.Monitor.OpenTelemetry.Exporter;
 
@@ -76,7 +77,7 @@ app.MapPost("/api/analyze_machine", async (
         var agents = new List<AIAgent>();
 
         // Agent Service agents (Azure AI Foundry hosted)
-        agents.AddRange(AgentServiceProvider.GetAgents(projectClient, logger));
+        agents.AddRange(await AgentServiceProvider.GetAgentsAsync(projectClient, logger));
 
         // Local agent with Cosmos DB tools
         var repairPlanner = LocalAgentProvider.GetRepairPlannerAgent(config, loggerFactory, logger);
@@ -90,9 +91,8 @@ app.MapPost("/api/analyze_machine", async (
         // ================================================================
         // Step 2: Build and execute the workflow
         // ================================================================
-        // Uses WorkflowBuilder to create a sequential pipeline.
-        // TextOnlyAgentExecutor strips MCP tool history between agents
-        // to work around SDK deserialization issues.
+        // Uses AgentWorkflowBuilder.BuildSequential for native SDK support.
+        // The latest SDK version handles conversation history properly.
         // ================================================================
 
         var telemetryJson = JsonSerializer.Serialize(request);
@@ -148,7 +148,7 @@ app.MapPost("/api/analyze_machine/stream", async (
     {
         // Collect agents (same as non-streaming endpoint)
         var agents = new List<AIAgent>();
-        agents.AddRange(AgentServiceProvider.GetAgents(projectClient, logger));
+        agents.AddRange(await AgentServiceProvider.GetAgentsAsync(projectClient, logger));
         
         var repairPlanner = LocalAgentProvider.GetRepairPlannerAgent(config, loggerFactory, logger);
         if (repairPlanner != null) agents.Add(repairPlanner);
@@ -164,23 +164,6 @@ app.MapPost("/api/analyze_machine/stream", async (
         // Track agent index for progress updates
         int agentIndex = 0;
 
-        // Set up callback to stream agent completions
-        TextOnlyAgentExecutor.SetEventCallback(async (step) =>
-        {
-            await SendEventAsync(new SseAgentCompleted { Step = step });
-            agentIndex++;
-            
-            // Send agent_started for next agent if there is one
-            if (agentIndex < agents.Count)
-            {
-                await SendEventAsync(new SseAgentStarted
-                {
-                    AgentName = agents[agentIndex].Name,
-                    AgentIndex = agentIndex
-                });
-            }
-        });
-
         // Send first agent_started event
         if (agents.Count > 0)
         {
@@ -191,9 +174,27 @@ app.MapPost("/api/analyze_machine/stream", async (
             });
         }
 
-        // Execute workflow
+        // Execute workflow with streaming events
         var telemetryJson = JsonSerializer.Serialize(request);
-        var workflowResult = await ExecuteWorkflowAsync(agents, telemetryJson, logger);
+        var workflowResult = await ExecuteWorkflowStreamingAsync(
+            agents, 
+            telemetryJson, 
+            logger,
+            async (step) =>
+            {
+                await SendEventAsync(new SseAgentCompleted { Step = step });
+                agentIndex++;
+                
+                // Send agent_started for next agent if there is one
+                if (agentIndex < agents.Count)
+                {
+                    await SendEventAsync(new SseAgentStarted
+                    {
+                        AgentName = agents[agentIndex].Name,
+                        AgentIndex = agentIndex
+                    });
+                }
+            });
 
         // Send final workflow_completed event
         await SendEventAsync(new SseWorkflowCompleted { Result = workflowResult });
@@ -202,11 +203,6 @@ app.MapPost("/api/analyze_machine/stream", async (
     {
         logger.LogError(ex, "SSE workflow failed for machine {MachineId}", request.machine_id);
         await SendEventAsync(new SseWorkflowError { Error = ex.Message });
-    }
-    finally
-    {
-        // Clear the callback to avoid memory leaks
-        TextOnlyAgentExecutor.SetEventCallback(null);
     }
 });
 
@@ -221,44 +217,241 @@ static async Task<WorkflowResponse> ExecuteWorkflowAsync(
     string input,
     ILogger logger)
 {
-    // Create executors that pass only text between agents
-    var executors = agents.Select(a => new TextOnlyAgentExecutor(a)).ToList();
+    // Build sequential workflow using the built-in AgentWorkflowBuilder.
+    // The SDK now properly handles conversation history between agents,
+    // eliminating the need for the TextOnlyAgentExecutor workaround.
+    var workflow = AgentWorkflowBuilder.BuildSequential(agents);
+    logger.LogInformation("Built sequential workflow with {Count} agents", agents.Count);
 
-    // Clear results from any previous run
-    TextOnlyAgentExecutor.ClearResults();
+    // Prepare input as a ChatMessage (required by agent workflows)
+    var messages = new List<ChatMessage> { new(ChatRole.User, input) };
 
-    // Build sequential workflow: agent1 → agent2 → agent3 → ...
-    var workflowBuilder = new WorkflowBuilder(executors[0]);
-    for (int i = 1; i < executors.Count; i++)
-    {
-        workflowBuilder.BindExecutor(executors[i]);
-        workflowBuilder.AddEdge(executors[i - 1], executors[i]);
-    }
-    workflowBuilder.WithOutputFrom(executors[^1]);
+    // Execute the workflow and collect events
+    var run = await InProcessExecution.Default.StreamAsync(workflow, messages);
 
-    var workflow = workflowBuilder.Build();
-    logger.LogInformation("Workflow built with {Count} agents", executors.Count);
-
-    // Execute the workflow
-    var run = await InProcessExecution.Default.StreamAsync<string>(workflow, input);
-
-
-
-    // Extract final output from workflow events
+    // Collect step results and final output
+    var agentSteps = new List<AgentStepResult>();
     string? finalOutput = null;
+    string? currentAgentName = null;
+    AgentStepResult? currentStep = null;
+
     await foreach (var evt in run.WatchStreamAsync())
     {
-        if (evt is WorkflowOutputEvent outputEvent && outputEvent.Is<string>(out var text))
+        switch (evt)
         {
-            finalOutput = text;
+            case ExecutorInvokedEvent invoked:
+                // New agent starting - create a step result
+                currentAgentName = invoked.ExecutorId;
+                currentStep = new AgentStepResult { AgentName = currentAgentName ?? "Unknown" };
+                logger.LogDebug("Agent {AgentName} invoked", currentAgentName);
+                break;
+
+            case AgentResponseEvent responseEvent:
+                // Collect agent response data using the typed Response property
+                if (currentStep != null && responseEvent.Response.Messages != null)
+                {
+                    foreach (var msg in responseEvent.Response.Messages)
+                    {
+                        if (msg.Role == ChatRole.Assistant)
+                        {
+                            foreach (var content in msg.Contents)
+                            {
+                                if (content is TextContent tc && !string.IsNullOrWhiteSpace(tc.Text))
+                                {
+                                    currentStep.TextOutput += tc.Text;
+                                    currentStep.FinalMessage = tc.Text;
+                                    finalOutput = tc.Text; // Keep updating with latest
+                                }
+                                else if (content is FunctionCallContent fcc)
+                                {
+                                    currentStep.ToolCalls.Add(new ToolCallInfo
+                                    {
+                                        ToolName = fcc.Name,
+                                        CallId = fcc.CallId,
+                                        Arguments = JsonSerializer.Serialize(fcc.Arguments)
+                                    });
+                                }
+                            }
+                        }
+                        else if (msg.Role == ChatRole.Tool)
+                        {
+                            foreach (var content in msg.Contents)
+                            {
+                                if (content is FunctionResultContent frc)
+                                {
+                                    var matchingCall = currentStep.ToolCalls.LastOrDefault(t => t.CallId == frc.CallId);
+                                    if (matchingCall != null)
+                                    {
+                                        matchingCall.Result = frc.Result?.ToString()?.Substring(0, Math.Min(500, frc.Result?.ToString()?.Length ?? 0));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                break;
+
+            case ExecutorCompletedEvent completed:
+                // Agent completed - save the step
+                if (currentStep != null)
+                {
+                    logger.LogDebug("Agent {AgentName} completed with {ToolCallCount} tool calls", 
+                        currentStep.AgentName, currentStep.ToolCalls.Count);
+                    agentSteps.Add(currentStep);
+                    currentStep = null;
+                }
+                break;
+
+            case WorkflowOutputEvent outputEvent:
+                // Capture final workflow output
+                if (outputEvent.Data is AgentResponse agentResponse)
+                {
+                    foreach (var msg in agentResponse.Messages ?? [])
+                    {
+                        if (msg.Role == ChatRole.Assistant)
+                        {
+                            foreach (var content in msg.Contents)
+                            {
+                                if (content is TextContent tc && !string.IsNullOrWhiteSpace(tc.Text))
+                                {
+                                    finalOutput = tc.Text;
+                                }
+                            }
+                        }
+                    }
+                }
+                break;
         }
     }
 
-    // Build response from collected step results
+    logger.LogInformation("Workflow completed with {StepCount} agent steps", agentSteps.Count);
+
     return new WorkflowResponse
     {
-        AgentSteps = TextOnlyAgentExecutor.StepResults.ToList(),
-        FinalMessage = finalOutput ?? TextOnlyAgentExecutor.StepResults.LastOrDefault()?.FinalMessage
+        AgentSteps = agentSteps,
+        FinalMessage = finalOutput ?? agentSteps.LastOrDefault()?.FinalMessage
+    };
+}
+
+/// <summary>
+/// Executes the workflow with streaming support, calling the onStepCompleted callback after each agent finishes.
+/// </summary>
+static async Task<WorkflowResponse> ExecuteWorkflowStreamingAsync(
+    List<AIAgent> agents,
+    string input,
+    ILogger logger,
+    Func<AgentStepResult, Task> onStepCompleted)
+{
+    // Build sequential workflow using the built-in AgentWorkflowBuilder
+    var workflow = AgentWorkflowBuilder.BuildSequential(agents);
+    logger.LogInformation("Built sequential workflow with {Count} agents for streaming", agents.Count);
+
+    // Prepare input as a ChatMessage
+    var messages = new List<ChatMessage> { new(ChatRole.User, input) };
+
+    // Execute the workflow and collect events with streaming callbacks
+    var run = await InProcessExecution.Default.StreamAsync(workflow, messages);
+
+    // Collect step results and final output
+    var agentSteps = new List<AgentStepResult>();
+    string? finalOutput = null;
+    string? currentAgentName = null;
+    AgentStepResult? currentStep = null;
+
+    await foreach (var evt in run.WatchStreamAsync())
+    {
+        switch (evt)
+        {
+            case ExecutorInvokedEvent invoked:
+                currentAgentName = invoked.ExecutorId;
+                currentStep = new AgentStepResult { AgentName = currentAgentName ?? "Unknown" };
+                logger.LogDebug("Agent {AgentName} invoked (streaming)", currentAgentName);
+                break;
+
+            case AgentResponseEvent responseEvent:
+                if (currentStep != null && responseEvent.Response.Messages != null)
+                {
+                    foreach (var msg in responseEvent.Response.Messages)
+                    {
+                        if (msg.Role == ChatRole.Assistant)
+                        {
+                            foreach (var content in msg.Contents)
+                            {
+                                if (content is TextContent tc && !string.IsNullOrWhiteSpace(tc.Text))
+                                {
+                                    currentStep.TextOutput += tc.Text;
+                                    currentStep.FinalMessage = tc.Text;
+                                    finalOutput = tc.Text;
+                                }
+                                else if (content is FunctionCallContent fcc)
+                                {
+                                    currentStep.ToolCalls.Add(new ToolCallInfo
+                                    {
+                                        ToolName = fcc.Name,
+                                        CallId = fcc.CallId,
+                                        Arguments = JsonSerializer.Serialize(fcc.Arguments)
+                                    });
+                                }
+                            }
+                        }
+                        else if (msg.Role == ChatRole.Tool)
+                        {
+                            foreach (var content in msg.Contents)
+                            {
+                                if (content is FunctionResultContent frc)
+                                {
+                                    var matchingCall = currentStep.ToolCalls.LastOrDefault(t => t.CallId == frc.CallId);
+                                    if (matchingCall != null)
+                                    {
+                                        matchingCall.Result = frc.Result?.ToString()?.Substring(0, Math.Min(500, frc.Result?.ToString()?.Length ?? 0));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                break;
+
+            case ExecutorCompletedEvent completed:
+                if (currentStep != null)
+                {
+                    logger.LogDebug("Agent {AgentName} completed (streaming) with {ToolCallCount} tool calls", 
+                        currentStep.AgentName, currentStep.ToolCalls.Count);
+                    agentSteps.Add(currentStep);
+                    
+                    // Notify the callback
+                    await onStepCompleted(currentStep);
+                    currentStep = null;
+                }
+                break;
+
+            case WorkflowOutputEvent outputEvent:
+                if (outputEvent.Data is AgentResponse agentResponse)
+                {
+                    foreach (var msg in agentResponse.Messages ?? [])
+                    {
+                        if (msg.Role == ChatRole.Assistant)
+                        {
+                            foreach (var content in msg.Contents)
+                            {
+                                if (content is TextContent tc && !string.IsNullOrWhiteSpace(tc.Text))
+                                {
+                                    finalOutput = tc.Text;
+                                }
+                            }
+                        }
+                    }
+                }
+                break;
+        }
+    }
+
+    logger.LogInformation("Streaming workflow completed with {StepCount} agent steps", agentSteps.Count);
+
+    return new WorkflowResponse
+    {
+        AgentSteps = agentSteps,
+        FinalMessage = finalOutput ?? agentSteps.LastOrDefault()?.FinalMessage
     };
 }
 

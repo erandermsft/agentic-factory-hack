@@ -168,13 +168,15 @@ public static class RepairPlannerAgentFactory
             tools.AddRange(CreateCosmosTools(cosmosService));
         }
 
+        // AsAIAgent extension method from Microsoft.Extensions.AI.ChatClientExtensions
+        // creates a ChatClientAgent from an IChatClient
         return new AzureOpenAIClient(new Uri(azureOpenAIEndpoint), new DefaultAzureCredential())
             .GetChatClient(deployment)
             .AsIChatClient()
             .AsBuilder()
             .UseOpenTelemetry()
             .Build()
-            .CreateAIAgent(
+            .AsAIAgent(
                 instructions: DefaultInstructions,
                 name: "RepairPlannerAgent",
                 tools: tools.Count > 0 ? tools : null);

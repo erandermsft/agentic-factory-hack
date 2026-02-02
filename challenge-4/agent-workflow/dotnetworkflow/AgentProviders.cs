@@ -1,4 +1,5 @@
 using Azure.AI.Projects;
+using Azure.AI.Agents.Persistent;
 using Microsoft.Agents.AI;
 using Microsoft.Agents.AI.A2A;
 using Microsoft.Extensions.Logging;
@@ -18,18 +19,20 @@ public static class AgentServiceProvider
     /// Retrieves agents from Azure AI Foundry Agent Service.
     /// - AnomalyClassificationAgent: Classifies telemetry anomalies by severity
     /// - FaultDiagnosisAgent: Diagnoses root causes of detected anomalies
+    /// Uses the new GetAIAgentAsync extension method from Microsoft.Agents.AI.AzureAI.
     /// </summary>
-    public static List<AIAgent> GetAgents(AIProjectClient projectClient, ILogger logger)
+    public static async Task<List<AIAgent>> GetAgentsAsync(AIProjectClient projectClient, ILogger logger)
     {
         var agents = new List<AIAgent>();
 
         // AnomalyClassificationAgent - classifies severity of telemetry anomalies
-        var anomalyAgent = projectClient.GetAIAgent("AnomalyClassificationAgent");
+        // Uses Azure.AI.Projects.AzureAIProjectChatClientExtensions.GetAIAgentAsync
+        var anomalyAgent = await projectClient.GetAIAgentAsync("AnomalyClassificationAgent");
         agents.Add(anomalyAgent);
         logger.LogInformation("Retrieved Agent Service agent: {AgentName}", anomalyAgent.Name);
 
         // FaultDiagnosisAgent - diagnoses root causes using knowledge base
-        var faultAgent = projectClient.GetAIAgent("FaultDiagnosisAgent");
+        var faultAgent = await projectClient.GetAIAgentAsync("FaultDiagnosisAgent");
         agents.Add(faultAgent);
         logger.LogInformation("Retrieved Agent Service agent: {AgentName}", faultAgent.Name);
 
