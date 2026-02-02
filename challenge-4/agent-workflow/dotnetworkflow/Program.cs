@@ -282,7 +282,8 @@ static async Task<WorkflowResponse> ExecuteWorkflowAsync(
                                     var matchingCall = currentStep.ToolCalls.LastOrDefault(t => t.CallId == frc.CallId);
                                     if (matchingCall != null)
                                     {
-                                        matchingCall.Result = frc.Result?.ToString()?.Substring(0, Math.Min(500, frc.Result?.ToString()?.Length ?? 0));
+                                        var resultStr = frc.Result?.ToString();
+                                        matchingCall.Result = resultStr?.Substring(0, Math.Min(500, resultStr.Length));
                                     }
                                 }
                             }
@@ -403,7 +404,8 @@ static async Task<WorkflowResponse> ExecuteWorkflowStreamingAsync(
                                     var matchingCall = currentStep.ToolCalls.LastOrDefault(t => t.CallId == frc.CallId);
                                     if (matchingCall != null)
                                     {
-                                        matchingCall.Result = frc.Result?.ToString()?.Substring(0, Math.Min(500, frc.Result?.ToString()?.Length ?? 0));
+                                        var resultStr = frc.Result?.ToString();
+                                        matchingCall.Result = resultStr?.Substring(0, Math.Min(500, resultStr.Length));
                                     }
                                 }
                             }
